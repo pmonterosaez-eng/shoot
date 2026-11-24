@@ -1,7 +1,8 @@
 import { useEffect } from 'react';
-import { Gamepad2, SlidersHorizontal, Volume2, VolumeX } from 'lucide-react';
+import { Film, Gamepad2, SlidersHorizontal, Volume2, VolumeX } from 'lucide-react';
 import { LEVELS } from '../game/levels';
 import { DIFFICULTY_SPECS, Difficulty } from '../game/types';
+import { ExtensionInstallButton } from './ExtensionInstallButton';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface TitleScreenProps {
@@ -10,7 +11,9 @@ interface TitleScreenProps {
   muted: boolean;
   gamepadConnected: boolean;
   optionsOpen: boolean;
+  cinematicOpen: boolean;
   onStart: (d: Difficulty) => void;
+  onOpenIntro: () => void;
   onOpenOptions: () => void;
   onToggleMute: () => void;
 }
@@ -21,13 +24,16 @@ export function TitleScreen({
   muted,
   gamepadConnected,
   optionsOpen,
+  cinematicOpen,
   onStart,
+  onOpenIntro,
   onOpenOptions,
   onToggleMute,
 }: TitleScreenProps) {
   useEffect(() => {
-    if (optionsOpen) return;
+    if (optionsOpen || cinematicOpen) return;
     const handleKey = (e: KeyboardEvent) => {
+      if (document.querySelector('[data-install-modal]')) return;
       if (e.code === 'Enter' || e.code === 'Space') {
         e.preventDefault();
         onStart(difficulty);
@@ -35,7 +41,7 @@ export function TitleScreen({
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [difficulty, optionsOpen, onStart]);
+  }, [difficulty, optionsOpen, cinematicOpen, onStart]);
 
   const activeLevel = LEVELS[startSectorIndex] ?? LEVELS[0];
 
@@ -45,16 +51,17 @@ export function TitleScreen({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <div className="px-3 py-1.5 bg-[#121014]/90 border border-stone-700/80 text-[11px] tracking-[0.2em] text-amber-400 uppercase font-bold">
-            10 SECTORES E1M1–E1M10 · 8 ARMAS
+            10 SECTORES · CUARTOS SECRETOS · 8 ARMAS
           </div>
           {gamepadConnected && (
             <div className="px-2.5 py-1.5 bg-[#121014]/90 border border-emerald-500/80 text-[11px] tracking-[0.16em] text-emerald-300 uppercase font-bold flex items-center gap-1.5">
               <Gamepad2 className="w-3.5 h-3.5" />
-              <span>MANDO LISTO</span>
+              <span>MANDO PS3 / PC LISTO</span>
             </div>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <ExtensionInstallButton compact />
           <PWAInstallButton compact />
           <button
             type="button"
@@ -122,7 +129,7 @@ export function TitleScreen({
         </svg>
 
         {/* Primary CTA & Options */}
-        <div className="mt-7 flex flex-col items-center gap-3 pointer-events-auto">
+        <div className="mt-7 flex flex-col items-center gap-2.5 pointer-events-auto">
           <div className="flex flex-wrap items-center justify-center gap-2">
             <div className="px-3.5 py-1 bg-[#121014]/95 border border-stone-700 text-[11px] font-bold tracking-[0.18em] uppercase text-stone-300">
               DIFICULTAD:{' '}
@@ -153,6 +160,15 @@ export function TitleScreen({
 
           <button
             type="button"
+            onClick={onOpenIntro}
+            className="w-64 py-2 bg-[#1a1518]/95 hover:bg-[#271d22] border border-amber-600/70 text-amber-300 font-bold text-xs tracking-[0.2em] uppercase flex items-center justify-center gap-2 cursor-pointer transition-colors"
+          >
+            <Film className="w-3.5 h-3.5 text-amber-400" />
+            <span>VER VIDEO INTRO</span>
+          </button>
+
+          <button
+            type="button"
             onClick={onOpenOptions}
             className="w-64 py-2.5 bg-[#141318]/95 hover:bg-[#201e27] border border-stone-600 text-stone-200 font-bold text-xs tracking-[0.2em] uppercase flex items-center justify-center gap-2 cursor-pointer transition-colors"
           >
@@ -166,8 +182,8 @@ export function TitleScreen({
       <div className="text-center">
         <p className="inline-block px-4 py-1.5 bg-[#0e0c10]/90 border border-stone-800 text-[11px] md:text-xs tracking-[0.14em] text-stone-300 uppercase">
           {gamepadConnected
-            ? 'Stick Izq Mover · Stick Der Apuntar · RT/A Disparar · LT Correr · LB/RB Armas · X Portal · Start Pausa'
-            : 'WASD Mover · Ratón/Flechas Apuntar · Click/Espacio Disparar · 1-8 Armas · E Portal · Esc Pausa · Mando'}
+            ? 'Sticks Mover/Apuntar · R2/✕ Disparar · L2 Correr · L1/R1 Armas · □/○ Abrir/Secretos · Start Pausa'
+            : 'WASD Mover · Ratón/Flechas Apuntar · Click/Espacio Disparar · 1-8 Armas · E Abrir/Secretos · Mando PS3/PC'}
         </p>
       </div>
     </div>

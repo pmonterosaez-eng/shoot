@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "AVERNO-93 — Retro 3D FPS",
+  "short_name": "AVERNO-93",
+  "version": "1.0.0",
+  "description": "Juego FPS 3D realista estilo Doom con 10 sectores distintos, cuartos secretos, 8 armas, hordas de demonios y soporte para mando PS3/PC.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Jugar AVERNO-93",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": []
+}

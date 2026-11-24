@@ -253,7 +253,7 @@ export interface LevelDef {
 export interface AutomapEntity {
   x: number;
   z: number;
-  kind: 'enemy' | 'key' | 'exit' | 'door' | 'boss';
+  kind: 'enemy' | 'key' | 'exit' | 'door' | 'boss' | 'secret';
   alive?: boolean;
 }
 
@@ -284,6 +284,8 @@ export interface HudSnapshot {
   hasKey: boolean;
   kills: number;
   totalEnemies: number;
+  secretsFound: number;
+  totalSecrets: number;
   shotsFired: number;
   shotsHit: number;
   elapsedSeconds: number;

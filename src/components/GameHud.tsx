@@ -63,7 +63,7 @@ export function GameHud({ hud, onSelectWeapon, onToggleMute, onPause }: GameHudP
         const ch = hud.automapGrid[z][x];
         const px = offsetX + x * cellPx;
         const py = offsetY + z * cellPx;
-        if (ch === '#' || ch === '$' || ch === '=') {
+        if (ch === '#' || ch === '$' || ch === '=' || ch === '?') {
           ctx.fillStyle = ch === '=' ? '#507288' : ch === '$' ? '#786252' : '#6b7280';
           ctx.fillRect(px, py, cellPx, cellPx);
         } else if (ch === '%' || ch === '&' || ch === '@') {
@@ -89,6 +89,9 @@ export function GameHud({ hud, onSelectWeapon, onToggleMute, onPause }: GameHudP
 
       if (ent.kind === 'door') {
         ctx.fillStyle = ent.alive ? '#ff2a2a' : '#22dd88';
+        ctx.fillRect(offsetX + ent.x * cellPx, offsetY + ent.z * cellPx, cellPx, cellPx);
+      } else if (ent.kind === 'secret') {
+        ctx.fillStyle = '#fbbf24';
         ctx.fillRect(offsetX + ent.x * cellPx, offsetY + ent.z * cellPx, cellPx, cellPx);
       } else if (ent.kind === 'key') {
         ctx.fillStyle = '#ff3344';
@@ -128,9 +131,6 @@ export function GameHud({ hud, onSelectWeapon, onToggleMute, onPause }: GameHudP
 
   return (
     <div className="fixed inset-0 z-10 pointer-events-none">
-      {/* Subtle CRT scanlines */}
-      <div className="absolute inset-0 scanlines opacity-30" />
-
       {/* Damage & Pickup Screen Flashes */}
       {hud.damageFlash > 0.01 && (
         <div
@@ -165,6 +165,11 @@ export function GameHud({ hud, onSelectWeapon, onToggleMute, onPause }: GameHudP
           <div className="px-2.5 py-1 bg-[#111015]/92 border border-stone-700 text-stone-200">
             DEMONIOS <span className="text-red-400">{hud.kills}</span>/{hud.totalEnemies}
           </div>
+          {hud.totalSecrets > 0 && (
+            <div className="px-2.5 py-1 bg-[#111015]/92 border border-stone-700 text-stone-200">
+              SECRETOS <span className="text-amber-300">{hud.secretsFound}</span>/{hud.totalSecrets}
+            </div>
+          )}
           <div className="px-2.5 py-1 bg-[#111015]/92 border border-stone-700 text-stone-200">
             PTS <span className="text-amber-300">{hud.score}</span>
           </div>

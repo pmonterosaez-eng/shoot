@@ -10,7 +10,10 @@ export function PWAInstallButton({ compact = false }: PWAInstallButtonProps) {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const [showGuide, setShowGuide] = useState(false);
 
-  if (isInstalled) {
+  const isExtension =
+    typeof window !== 'undefined' && window.location.protocol === 'chrome-extension:';
+
+  if (isInstalled || isExtension) {
     return null;
   }
 

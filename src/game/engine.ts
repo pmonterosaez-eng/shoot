@@ -1,5 +1,11 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { VignetteShader } from 'three/addons/shaders/VignetteShader.js';
 import { RetroAudio } from './audio';
 import { LEVELS } from './levels';
 import {
@@ -39,6 +45,16 @@ interface DoorEntity {
   openProgress: number; // 0 = closed, 1 = open
   targetOpen: number;
   closeTimer: number;
+  mesh: THREE.Mesh;
+  baseY: number;
+}
+
+interface SecretWallEntity {
+  gx: number;
+  gz: number;
+  discovered: boolean;
+  openProgress: number;
+  targetOpen: number;
   mesh: THREE.Mesh;
   baseY: number;
 }
@@ -119,6 +135,26 @@ interface ParticleEntity {
   mesh: THREE.Mesh;
 }
 
+interface ShellEntity {
+  active: boolean;
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  life: number;
+  mesh: THREE.Mesh;
+}
+
+interface DecalEntity {
+  mesh: THREE.Mesh;
+  timer: number;
+}
+
 export class DoomEngine {
   private container: HTMLElement;
   private onHudUpdate: (snapshot: HudSnapshot) => void;
@@ -126,6 +162,8 @@ export class DoomEngine {
 
   private isSoftwareGl = false;
   private renderer!: THREE.WebGLRenderer;
+  private composer: EffectComposer | null = null;
+  private bloomPass: UnrealBloomPass | null = null;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private textures!: RetroTextureSet;
@@ -140,6 +178,14 @@ export class DoomEngine {
   private playerLight!: THREE.PointLight;
   private keyLight!: THREE.DirectionalLight;
   private hemiLight!: THREE.HemisphereLight;
+  private projLights: THREE.PointLight[] = [];
+  private ambientPoints: THREE.Points | null = null;
+  private ambientBasePos: Float32Array | null = null;
+  private shells: ShellEntity[] = [];
+  private decals: DecalEntity[] = [];
+  private decalCursor = 0;
+  private currentFov = 72;
+  private cameraRoll = 0;
 
   // Game state
   private phase: GamePhase = 'title';
@@ -161,6 +207,10 @@ export class DoomEngine {
   private pvz = 0;
   private yaw = 0;
   private pitch = 0;
+  private smoothYaw = 0;
+  private smoothPitch = 0;
+  private weaponSwayX = 0;
+  private weaponSwayY = 0;
   private walkBob = 0;
   private health = 100;
   private maxHealth = 100;
@@ -181,6 +231,8 @@ export class DoomEngine {
   private startSectorIndex = 0;
   private kills = 0;
   private totalEnemies = 0;
+  private secretsFound = 0;
+  private totalSecrets = 0;
   private shotsFired = 0;
   private shotsHit = 0;
   private elapsedSeconds = 0;
@@ -198,9 +250,11 @@ export class DoomEngine {
   private ambushTriggered = false;
   private bossEnragedTriggered = false;
   private bossVictoryCountdown = 0;
+  private cinematicActive = false;
 
   // Entities
   private doors: DoorEntity[] = [];
+  private secretWalls: SecretWallEntity[] = [];
   private barrels: BarrelEntity[] = [];
   private pickups: PickupEntity[] = [];
   private enemies: EnemyEntity[] = [];
@@ -240,7 +294,9 @@ export class DoomEngine {
     this.onHudUpdate = onHudUpdate;
     this.initRenderer();
     this.initScene();
+    this.initPostProcessing();
     this.initParticlePool();
+    this.initShellAndDecalPools();
     this.bindEvents();
     this.loadLevel(0, true);
     this.lastTime = performance.now();
@@ -249,13 +305,17 @@ export class DoomEngine {
   }
 
   private detectSoftwareGl(): boolean {
-    const gl = document.createElement('canvas').getContext('webgl2');
+    const canvas = document.createElement('canvas');
+    const gl =
+      canvas.getContext('webgl2') ||
+      (canvas.getContext('webgl') as WebGLRenderingContext | null) ||
+      (canvas.getContext('experimental-webgl') as WebGLRenderingContext | null);
     if (!gl) return true;
     const ext = gl.getExtension('WEBGL_debug_renderer_info');
     const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
     const gpu = String(gl.getParameter(param));
     gl.getExtension('WEBGL_lose_context')?.loseContext();
-    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render|RSX/i.test(gpu);
   }
 
   private initRenderer(): void {
@@ -292,33 +352,42 @@ export class DoomEngine {
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
     this.scene.environment = this.envRT.texture;
+    this.scene.environmentIntensity = 0.85;
     pmrem.dispose();
 
-    // Lighting rig (warm/cool contrast)
+    // Lighting rig (warm/cool contrast + soft high-res shadows)
     this.hemiLight = new THREE.HemisphereLight(0x3b4d68, 0x241614, 0.95);
     this.scene.add(this.hemiLight);
 
-    this.keyLight = new THREE.DirectionalLight(0xffb37a, 1.45);
+    this.keyLight = new THREE.DirectionalLight(0xffb37a, 1.5);
     this.keyLight.position.set(16, 26, 12);
     this.keyLight.castShadow = true;
-    this.keyLight.shadow.mapSize.set(1024, 1024);
+    const shadowSize = this.isSoftwareGl ? 512 : 2048;
+    this.keyLight.shadow.mapSize.set(shadowSize, shadowSize);
+    this.keyLight.shadow.radius = 2.6;
     this.keyLight.shadow.camera.near = 2;
-    this.keyLight.shadow.camera.far = 70;
-    const d = 28;
+    this.keyLight.shadow.camera.far = 75;
+    const d = 30;
     this.keyLight.shadow.camera.left = -d;
     this.keyLight.shadow.camera.right = d;
     this.keyLight.shadow.camera.top = d;
     this.keyLight.shadow.camera.bottom = -d;
-    this.keyLight.shadow.bias = -0.0005;
-    this.keyLight.shadow.normalBias = 0.02;
+    this.keyLight.shadow.bias = -0.0004;
+    this.keyLight.shadow.normalBias = 0.025;
     this.scene.add(this.keyLight);
 
-    // Tactical player headlamp glow so dark corridors read cleanly
-    this.playerLight = new THREE.PointLight(0xffddbb, 1.35, 16, 1.6);
+    // Tactical player headlamp + 2 dynamic projectile lights for dramatic corridor illumination
+    this.playerLight = new THREE.PointLight(0xffddbb, 1.5, 20, 1.45);
     this.camera.add(this.playerLight);
 
+    for (let i = 0; i < 2; i++) {
+      const pl = new THREE.PointLight(0xff7722, 0, 12, 1.6);
+      this.scene.add(pl);
+      this.projLights.push(pl);
+    }
+
     // First-person weapon mount attached to camera
-    this.weaponModels = buildWeaponViewmodels();
+    this.weaponModels = buildWeaponViewmodels(true);
     Object.values(this.weaponModels).forEach((model) => {
       model.visible = false;
       this.weaponMount.add(model);
@@ -327,14 +396,21 @@ export class DoomEngine {
     this.weaponMount.position.set(0.22, -0.24, -0.28);
     this.camera.add(this.weaponMount);
 
-    // Muzzle flash light & burst geometry
-    this.muzzleLight = new THREE.PointLight(0xffaa33, 0, 12, 1.8);
+    // Muzzle flash light & textured radial burst
+    this.muzzleLight = new THREE.PointLight(0xffaa33, 0, 14, 1.7);
     this.muzzleLight.position.set(0.22, -0.14, -0.95);
     this.camera.add(this.muzzleLight);
 
     this.muzzleMesh = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.11, 0),
-      new THREE.MeshBasicMaterial({ color: 0xffdd55, transparent: true, opacity: 0 }),
+      new THREE.PlaneGeometry(0.42, 0.42),
+      new THREE.MeshBasicMaterial({
+        color: 0xffdd77,
+        map: this.textures.softParticleTex,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
     );
     this.muzzleMesh.position.set(0.22, -0.15, -0.98);
     this.camera.add(this.muzzleMesh);
@@ -343,10 +419,37 @@ export class DoomEngine {
     this.scene.add(this.entityGroup);
   }
 
+  private initPostProcessing(): void {
+    if (this.isSoftwareGl || !this.renderer.capabilities.isWebGL2) {
+      return;
+    }
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    const pr = Math.min(window.devicePixelRatio, 2);
+    const rt = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(w * pr)), Math.max(1, Math.floor(h * pr)), {
+      type: THREE.HalfFloatType,
+    });
+    this.composer = new EffectComposer(this.renderer, rt);
+    this.composer.setPixelRatio(pr);
+    this.composer.setSize(w, h);
+
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.34, 0.46, 0.88);
+    this.composer.addPass(this.bloomPass);
+
+    const vignettePass = new ShaderPass(VignetteShader);
+    vignettePass.uniforms['offset'].value = 1.12;
+    vignettePass.uniforms['darkness'].value = 0.48;
+    this.composer.addPass(vignettePass);
+
+    this.composer.addPass(new OutputPass());
+  }
+
   private initParticlePool(): void {
-    const geo = new THREE.BoxGeometry(0.13, 0.13, 0.13);
-    for (let i = 0; i < 90; i++) {
-      const mat = new THREE.MeshBasicMaterial({ color: 0xff8822 });
+    const geo = new THREE.SphereGeometry(0.068, 10, 8);
+    for (let i = 0; i < 110; i++) {
+      const mat = new THREE.MeshBasicMaterial({ color: 0xff8822, transparent: true, opacity: 0.9 });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.visible = false;
       this.scene.add(mesh);
@@ -366,17 +469,82 @@ export class DoomEngine {
     }
   }
 
+  private initShellAndDecalPools(): void {
+    const shellGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.045, 8);
+    const shellMat = new THREE.MeshStandardMaterial({
+      color: 0xd9a83c,
+      roughness: 0.22,
+      metalness: 0.92,
+    });
+    for (let i = 0; i < 28; i++) {
+      const mesh = new THREE.Mesh(shellGeo, shellMat);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.shells.push({
+        active: false,
+        x: 0,
+        y: 0,
+        z: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        rx: 0,
+        ry: 0,
+        rz: 0,
+        life: 0,
+        mesh,
+      });
+    }
+
+    const decalGeo = new THREE.PlaneGeometry(1.15, 1.15);
+    decalGeo.rotateX(-Math.PI / 2);
+    for (let i = 0; i < 36; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        map: this.textures.decalBloodTex,
+        transparent: true,
+        opacity: 0.85,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      });
+      const mesh = new THREE.Mesh(decalGeo, mat);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.decals.push({ mesh, timer: 0 });
+    }
+  }
+
   private clearLevel(): void {
     this.doors = [];
+    this.secretWalls = [];
     this.barrels = [];
     this.pickups = [];
     this.enemies = [];
     this.projectiles.forEach((p) => this.scene.remove(p.mesh));
     this.projectiles = [];
+    this.projLights.forEach((pl) => {
+      pl.intensity = 0;
+    });
     this.particles.forEach((p) => {
       p.active = false;
       p.mesh.visible = false;
     });
+    this.shells.forEach((s) => {
+      s.active = false;
+      s.mesh.visible = false;
+    });
+    this.decals.forEach((d) => {
+      d.mesh.visible = false;
+      d.timer = 0;
+    });
+    if (this.ambientPoints) {
+      this.levelGroup.remove(this.ambientPoints);
+      this.ambientPoints.geometry.dispose();
+      (this.ambientPoints.material as THREE.Material).dispose();
+      this.ambientPoints = null;
+      this.ambientBasePos = null;
+    }
     this.exitParts = null;
 
     while (this.levelGroup.children.length > 0) {
@@ -409,7 +577,7 @@ export class DoomEngine {
     this.explored = Array.from({ length: this.gridH }, () => Array(this.gridW).fill(false));
 
     if (resetPlayerStats) {
-      this.health = 100;
+      this.health = this.maxHealth;
       this.armor = this.difficulty === 'facil' ? 50 : this.difficulty === 'normal' ? 35 : 15;
       this.ammo = 999;
       this.unlockedWeapons = [...WEAPON_ORDER];
@@ -419,6 +587,8 @@ export class DoomEngine {
       this.shotsHit = 0;
       this.elapsedSeconds = 0;
       this.score = 0;
+    } else if (this.health <= 0) {
+      this.health = this.maxHealth;
     }
 
     this.hasKey = false;
@@ -429,12 +599,20 @@ export class DoomEngine {
     this.bossVictoryCountdown = 0;
     this.totalEnemies = 0;
     this.kills = 0;
+    this.secretsFound = 0;
+    this.totalSecrets = 0;
     this.pvx = 0;
     this.pvz = 0;
     this.pitch = 0;
+    this.smoothPitch = 0;
+    this.weaponSwayX = 0;
+    this.weaponSwayY = 0;
+    this.fireCooldown = 0;
     this.weaponRecoil = 0;
     this.damageFlash = 0;
     this.pickupFlash = 0;
+    this.faceMood = 'normal';
+    this.faceMoodTimer = 0;
     this.promptText = null;
     this.setStatus(
       lvl.isBossLevel ? `${lvl.code}: ANIQUILA AL TITÁN DEL AVERNO` : `${lvl.code}: ${lvl.name}`,
@@ -442,7 +620,7 @@ export class DoomEngine {
     );
     this.switchWeapon(this.activeWeapon, true);
 
-    // Floor & Ceiling planes
+    // Floor & Ceiling planes with full PBR normal + roughness maps
     const mapW = this.gridW * cs;
     const mapH = this.gridH * cs;
     const floorTex =
@@ -453,11 +631,32 @@ export class DoomEngine {
         : lvl.floorTheme === 'obsidian'
         ? this.textures.floorObsidian
         : this.textures.floorStone;
+    const floorNormal =
+      lvl.floorTheme === 'grate'
+        ? this.textures.floorGrateNormal
+        : lvl.floorTheme === 'metal'
+        ? this.textures.floorMetalNormal
+        : lvl.floorTheme === 'obsidian'
+        ? this.textures.floorObsidianNormal
+        : this.textures.floorStoneNormal;
+    const floorRough =
+      lvl.floorTheme === 'grate'
+        ? this.textures.floorGrateRoughness
+        : lvl.floorTheme === 'metal'
+        ? this.textures.floorMetalRoughness
+        : lvl.floorTheme === 'obsidian'
+        ? this.textures.floorObsidianRoughness
+        : this.textures.floorStoneRoughness;
     floorTex.repeat.set(this.gridW, this.gridH);
+    floorNormal.repeat.set(this.gridW, this.gridH);
+    floorRough.repeat.set(this.gridW, this.gridH);
     const floorMat = new THREE.MeshStandardMaterial({
       map: floorTex,
-      roughness: lvl.floorTheme === 'metal' ? 0.58 : 0.78,
-      metalness: lvl.floorTheme === 'metal' ? 0.45 : 0.22,
+      normalMap: floorNormal,
+      normalScale: new THREE.Vector2(1.25, 1.25),
+      roughnessMap: floorRough,
+      roughness: 1.0,
+      metalness: lvl.floorTheme === 'metal' || lvl.floorTheme === 'grate' ? 0.52 : 0.2,
     });
     const floor = new THREE.Mesh(new THREE.PlaneGeometry(mapW, mapH), floorMat);
     floor.rotation.x = -Math.PI / 2;
@@ -466,77 +665,122 @@ export class DoomEngine {
     this.levelGroup.add(floor);
 
     this.textures.ceilingTech.repeat.set(this.gridW, this.gridH);
+    this.textures.ceilingTechNormal.repeat.set(this.gridW, this.gridH);
     const ceilMat = new THREE.MeshStandardMaterial({
       map: this.textures.ceilingTech,
-      roughness: 0.85,
-      metalness: 0.35,
+      normalMap: this.textures.ceilingTechNormal,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      roughness: 0.72,
+      metalness: 0.45,
     });
     const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(mapW, mapH), ceilMat);
     ceiling.rotation.x = Math.PI / 2;
     ceiling.position.set(mapW / 2 - cs / 2, wh, mapH / 2 - cs / 2);
     this.levelGroup.add(ceiling);
 
-    // Wall & prop materials
+    // Wall & prop PBR materials with full Normal + Roughness maps
     const techWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.techWall,
-      roughness: 0.55,
-      metalness: 0.45,
+      normalMap: this.textures.techWallNormal,
+      normalScale: new THREE.Vector2(1.3, 1.3),
+      roughnessMap: this.textures.techWallRoughness,
+      roughness: 1.0,
+      metalness: 0.56,
     });
     const hellWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.hellWall,
-      roughness: 0.75,
-      metalness: 0.15,
+      normalMap: this.textures.hellWallNormal,
+      normalScale: new THREE.Vector2(1.45, 1.45),
+      roughnessMap: this.textures.hellWallRoughness,
+      roughness: 1.0,
+      metalness: 0.16,
     });
     const reactorWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.reactorWall,
-      roughness: 0.48,
-      metalness: 0.55,
+      normalMap: this.textures.reactorWallNormal,
+      normalScale: new THREE.Vector2(1.25, 1.25),
+      roughnessMap: this.textures.reactorWallRoughness,
+      roughness: 1.0,
+      metalness: 0.62,
       emissive: 0x3a0f04,
       emissiveIntensity: 0.65,
     });
     const rustWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.rustWall,
-      roughness: 0.82,
-      metalness: 0.35,
+      normalMap: this.textures.rustWallNormal,
+      normalScale: new THREE.Vector2(1.2, 1.2),
+      roughnessMap: this.textures.rustWallRoughness,
+      roughness: 1.0,
+      metalness: 0.36,
     });
     const obsidianWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.obsidianWall,
-      roughness: 0.65,
-      metalness: 0.25,
+      normalMap: this.textures.obsidianWallNormal,
+      normalScale: new THREE.Vector2(1.3, 1.3),
+      roughnessMap: this.textures.obsidianWallRoughness,
+      roughness: 1.0,
+      metalness: 0.34,
       emissive: 0x24060c,
       emissiveIntensity: 0.45,
     });
     const cyberWallMat = new THREE.MeshStandardMaterial({
       map: this.textures.cyberWall,
-      roughness: 0.42,
-      metalness: 0.65,
-      emissive: 0x051822,
-      emissiveIntensity: 0.4,
+      normalMap: this.textures.cyberWallNormal,
+      normalScale: new THREE.Vector2(1.2, 1.2),
+      roughnessMap: this.textures.cyberWallRoughness,
+      roughness: 1.0,
+      metalness: 0.74,
+      emissive: 0x061b26,
+      emissiveIntensity: 0.48,
     });
     const pillarMat = new THREE.MeshStandardMaterial({
       map: this.textures.pillarTex,
-      roughness: 0.45,
-      metalness: 0.55,
+      normalMap: this.textures.pillarNormal,
+      normalScale: new THREE.Vector2(1.35, 1.35),
+      roughnessMap: this.textures.pillarRoughness,
+      roughness: 1.0,
+      metalness: 0.62,
     });
     const crateMat = new THREE.MeshStandardMaterial({
       map: this.textures.crateTex,
-      roughness: 0.8,
-      metalness: 0.12,
+      normalMap: this.textures.crateNormal,
+      normalScale: new THREE.Vector2(1.3, 1.3),
+      roughnessMap: this.textures.crateRoughness,
+      roughness: 1.0,
+      metalness: 0.14,
     });
     const hazardMat = new THREE.MeshStandardMaterial({
       map: lvl.hazardType === 'acid' ? this.textures.acidFloor : this.textures.lavaFloor,
-      emissive: lvl.hazardType === 'acid' ? 0x1e6610 : 0xaa2806,
-      emissiveIntensity: 1.25,
-      roughness: 0.35,
+      normalMap: lvl.hazardType === 'acid' ? this.textures.acidFloorNormal : this.textures.lavaFloorNormal,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      emissive: lvl.hazardType === 'acid' ? 0x1e6610 : 0xbb2c06,
+      emissiveIntensity: 1.45,
+      roughness: lvl.hazardType === 'acid' ? 0.16 : 0.34,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
     });
 
     const wallGeo = new THREE.BoxGeometry(cs, wh, cs);
-    const pillarGeo = new THREE.BoxGeometry(cs * 0.46, wh, cs * 0.46);
-    const crateGeo = new THREE.BoxGeometry(cs * 0.48, 1.35, cs * 0.48);
     const hazardGeo = new THREE.PlaneGeometry(cs, cs);
+
+    const pickWallMat = (wallCh: string) =>
+      wallCh === '#'
+        ? techWallMat
+        : wallCh === '%'
+        ? hellWallMat
+        : wallCh === '&'
+        ? reactorWallMat
+        : wallCh === '$'
+        ? rustWallMat
+        : wallCh === '@'
+        ? obsidianWallMat
+        : cyberWallMat;
+
+    const wallTrimCoords: [number, number][] = [];
+    const pillarCoords: [number, number][] = [];
+    const crateCoords: [number, number][] = [];
+    const ceilingLampCoords: [number, number][] = [];
 
     for (let gz = 0; gz < this.gridH; gz++) {
       for (let gx = 0; gx < this.gridW; gx++) {
@@ -545,35 +789,50 @@ export class DoomEngine {
         const wz = gz * cs;
 
         if (this.isWallChar(ch)) {
-          const mat =
-            ch === '#'
-              ? techWallMat
-              : ch === '%'
-              ? hellWallMat
-              : ch === '&'
-              ? reactorWallMat
-              : ch === '$'
-              ? rustWallMat
-              : ch === '@'
-              ? obsidianWallMat
-              : cyberWallMat;
-          const wall = new THREE.Mesh(wallGeo, mat);
+          const wall = new THREE.Mesh(wallGeo, pickWallMat(ch));
           wall.position.set(wx, wh / 2, wz);
           wall.castShadow = true;
           wall.receiveShadow = true;
           this.levelGroup.add(wall);
+          // Only add skirting trim if adjacent to an interior walkable cell
+          if (
+            !this.isWallChar(this.grid[gz]?.[gx - 1]) ||
+            !this.isWallChar(this.grid[gz]?.[gx + 1]) ||
+            !this.isWallChar(this.grid[gz - 1]?.[gx]) ||
+            !this.isWallChar(this.grid[gz + 1]?.[gx])
+          ) {
+            wallTrimCoords.push([wx, wz]);
+          }
+        } else if (ch === '?') {
+          const neighbors = [
+            this.grid[gz]?.[gx - 1],
+            this.grid[gz]?.[gx + 1],
+            this.grid[gz - 1]?.[gx],
+            this.grid[gz + 1]?.[gx],
+          ];
+          const adjWall = neighbors.find((n) => this.isWallChar(n)) || '#';
+          const baseMat = pickWallMat(adjWall).clone();
+          baseMat.emissive.setHex(0x1f1408);
+          baseMat.emissiveIntensity = 0.25;
+          const secretMesh = new THREE.Mesh(wallGeo, baseMat);
+          secretMesh.position.set(wx, wh / 2, wz);
+          secretMesh.castShadow = true;
+          secretMesh.receiveShadow = true;
+          this.levelGroup.add(secretMesh);
+          this.secretWalls.push({
+            gx,
+            gz,
+            discovered: false,
+            openProgress: 0,
+            targetOpen: 0,
+            mesh: secretMesh,
+            baseY: wh / 2,
+          });
+          this.totalSecrets++;
         } else if (ch === 'P') {
-          const pillar = new THREE.Mesh(pillarGeo, pillarMat);
-          pillar.position.set(wx, wh / 2, wz);
-          pillar.castShadow = true;
-          pillar.receiveShadow = true;
-          this.levelGroup.add(pillar);
+          pillarCoords.push([wx, wz]);
         } else if (ch === 'C') {
-          const crate = new THREE.Mesh(crateGeo, crateMat);
-          crate.position.set(wx, 1.35 / 2, wz);
-          crate.castShadow = true;
-          crate.receiveShadow = true;
-          this.levelGroup.add(crate);
+          crateCoords.push([wx, wz]);
         } else if (ch === '~') {
           const haz = new THREE.Mesh(hazardGeo, hazardMat);
           haz.rotation.x = -Math.PI / 2;
@@ -583,10 +842,12 @@ export class DoomEngine {
           const locked = ch === 'K';
           const doorMat = new THREE.MeshStandardMaterial({
             map: locked ? this.textures.doorLocked : this.textures.doorTech,
-            roughness: 0.38,
-            metalness: 0.65,
+            normalMap: locked ? this.textures.doorLockedNormal : this.textures.doorTechNormal,
+            normalScale: new THREE.Vector2(1.3, 1.3),
+            roughnessMap: this.textures.doorTechRoughness,
+            roughness: 1.0,
+            metalness: 0.72,
           });
-          // Align thin door panel across corridor
           const horizCorridor = this.isWallChar(this.grid[gz]?.[gx - 1]) || this.isWallChar(this.grid[gz]?.[gx + 1]);
           const doorGeo = horizCorridor
             ? new THREE.BoxGeometry(cs, wh, cs * 0.24)
@@ -606,64 +867,235 @@ export class DoomEngine {
             mesh: doorMesh,
             baseY: wh / 2,
           });
-        } else if (ch === 'S') {
-          this.px = wx;
-          this.pz = wz;
-          this.yaw = lvl.startYaw ?? -Math.PI * 0.5;
-        } else if (ch === 'B') {
-          const barrel = buildBarrelModel(this.textures);
-          barrel.position.set(wx, 0, wz);
-          this.entityGroup.add(barrel);
-          this.barrels.push({
-            id: this.nextEntityId++,
-            x: wx,
-            z: wz,
-            hp: 25,
-            alive: true,
-            mesh: barrel,
-            hitFlash: 0,
-          });
-        } else if (ch === 'X') {
-          this.hasExitPortal = true;
-          this.exitPos.set(wx, 0, wz);
-          this.exitParts = buildExitPortal();
-          this.exitParts.group.position.set(wx, 0, wz);
-          this.entityGroup.add(this.exitParts.group);
-        } else if (
-          ch === 'H' ||
-          ch === 'A' ||
-          ch === 'M' ||
-          ch === 'Y' ||
-          ch === 'U' ||
-          ch === 'G' ||
-          ch === 'W' ||
-          ch === 'R' ||
-          ch === 'F'
-        ) {
-          const mapKind: Record<string, PickupKind> = {
-            H: 'health',
-            A: 'armor',
-            M: 'ammo',
-            Y: 'key',
-            U: 'supershotgun_gun',
-            G: 'chaingun_gun',
-            W: 'plasma_gun',
-            R: 'rocket_gun',
-            F: 'bfg_gun',
-          };
-          this.spawnPickup(mapKind[ch], wx, wz);
-        } else if (ch === 'i' || ch === 't' || ch === 'c' || ch === 'b' || ch === 'T') {
-          const kindMap: Record<string, EnemyKind> = {
-            i: 'imp',
-            t: 'trooper',
-            c: 'cacodemon',
-            b: 'baron',
-            T: 'titan',
-          };
-          this.spawnEnemy(kindMap[ch], wx, wz, ch === 'T');
+        } else {
+          if ((gx + gz) % 4 === 0 && gx % 2 === 1 && gz % 2 === 1) {
+            ceilingLampCoords.push([wx, wz]);
+          }
+          if (ch === 'S') {
+            this.px = wx;
+            this.pz = wz;
+            this.yaw = lvl.startYaw ?? -Math.PI * 0.5;
+            this.smoothYaw = this.yaw;
+          } else if (ch === 'B') {
+            const barrel = buildBarrelModel(this.textures);
+            barrel.position.set(wx, 0, wz);
+            this.entityGroup.add(barrel);
+            this.barrels.push({
+              id: this.nextEntityId++,
+              x: wx,
+              z: wz,
+              hp: 25,
+              alive: true,
+              mesh: barrel,
+              hitFlash: 0,
+            });
+          } else if (ch === 'X') {
+            this.hasExitPortal = true;
+            this.exitPos.set(wx, 0, wz);
+            this.exitParts = buildExitPortal(this.textures);
+            this.exitParts.group.position.set(wx, 0, wz);
+            this.entityGroup.add(this.exitParts.group);
+          } else if (
+            ch === 'H' ||
+            ch === 'A' ||
+            ch === 'M' ||
+            ch === 'Y' ||
+            ch === 'U' ||
+            ch === 'G' ||
+            ch === 'W' ||
+            ch === 'R' ||
+            ch === 'F'
+          ) {
+            const mapKind: Record<string, PickupKind> = {
+              H: 'health',
+              A: 'armor',
+              M: 'ammo',
+              Y: 'key',
+              U: 'supershotgun_gun',
+              G: 'chaingun_gun',
+              W: 'plasma_gun',
+              R: 'rocket_gun',
+              F: 'bfg_gun',
+            };
+            this.spawnPickup(mapKind[ch], wx, wz);
+          } else if (ch === 'i' || ch === 't' || ch === 'c' || ch === 'b' || ch === 'T') {
+            const kindMap: Record<string, EnemyKind> = {
+              i: 'imp',
+              t: 'trooper',
+              c: 'cacodemon',
+              b: 'baron',
+              T: 'titan',
+            };
+            this.spawnEnemy(kindMap[ch], wx, wz, ch === 'T');
+          }
         }
       }
     }
+
+    const dummy = new THREE.Object3D();
+    const trimMat = new THREE.MeshStandardMaterial({
+      color: 0x1b1e25,
+      roughness: 0.36,
+      metalness: 0.82,
+    });
+
+    // Instanced Baseboard & Crown Trim around exposed walls
+    if (wallTrimCoords.length > 0) {
+      const trimGeo = new THREE.BoxGeometry(cs + 0.08, 0.22, cs + 0.08);
+      const baseTrim = new THREE.InstancedMesh(trimGeo, trimMat, wallTrimCoords.length);
+      const crownTrim = new THREE.InstancedMesh(trimGeo, trimMat, wallTrimCoords.length);
+      baseTrim.receiveShadow = true;
+      wallTrimCoords.forEach(([wx, wz], idx) => {
+        dummy.position.set(wx, 0.11, wz);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        baseTrim.setMatrixAt(idx, dummy.matrix);
+
+        dummy.position.set(wx, wh - 0.11, wz);
+        dummy.updateMatrix();
+        crownTrim.setMatrixAt(idx, dummy.matrix);
+      });
+      baseTrim.instanceMatrix.needsUpdate = true;
+      crownTrim.instanceMatrix.needsUpdate = true;
+      baseTrim.computeBoundingSphere();
+      crownTrim.computeBoundingSphere();
+      this.levelGroup.add(baseTrim, crownTrim);
+    }
+
+    // Instanced Multi-Part Fluted Pillars (P)
+    if (pillarCoords.length > 0) {
+      const shaftGeo = new THREE.CylinderGeometry(cs * 0.19, cs * 0.21, wh, 18);
+      const plinthGeo = new THREE.BoxGeometry(cs * 0.52, 0.28, cs * 0.52);
+      const shafts = new THREE.InstancedMesh(shaftGeo, pillarMat, pillarCoords.length);
+      const bases = new THREE.InstancedMesh(plinthGeo, trimMat, pillarCoords.length);
+      const caps = new THREE.InstancedMesh(plinthGeo, trimMat, pillarCoords.length);
+      shafts.castShadow = true;
+      shafts.receiveShadow = true;
+      bases.castShadow = true;
+      bases.receiveShadow = true;
+      pillarCoords.forEach(([wx, wz], idx) => {
+        dummy.position.set(wx, wh / 2, wz);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        shafts.setMatrixAt(idx, dummy.matrix);
+
+        dummy.position.set(wx, 0.14, wz);
+        dummy.updateMatrix();
+        bases.setMatrixAt(idx, dummy.matrix);
+
+        dummy.position.set(wx, wh - 0.14, wz);
+        dummy.updateMatrix();
+        caps.setMatrixAt(idx, dummy.matrix);
+      });
+      shafts.instanceMatrix.needsUpdate = true;
+      bases.instanceMatrix.needsUpdate = true;
+      caps.instanceMatrix.needsUpdate = true;
+      shafts.computeBoundingSphere();
+      bases.computeBoundingSphere();
+      caps.computeBoundingSphere();
+      this.levelGroup.add(shafts, bases, caps);
+    }
+
+    // Instanced Multi-Part Reinforced Crates (C)
+    if (crateCoords.length > 0) {
+      const crateGeo = new THREE.BoxGeometry(cs * 0.48, 1.35, cs * 0.48);
+      const braceGeo = new THREE.BoxGeometry(cs * 0.51, 0.16, cs * 0.51);
+      const crates = new THREE.InstancedMesh(crateGeo, crateMat, crateCoords.length);
+      const braces = new THREE.InstancedMesh(braceGeo, trimMat, crateCoords.length);
+      crates.castShadow = true;
+      crates.receiveShadow = true;
+      braces.castShadow = true;
+      crateCoords.forEach(([wx, wz], idx) => {
+        dummy.position.set(wx, 1.35 / 2, wz);
+        dummy.rotation.set(0, (idx % 3) * 0.04 - 0.04, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        crates.setMatrixAt(idx, dummy.matrix);
+
+        dummy.position.set(wx, 1.26, wz);
+        dummy.updateMatrix();
+        braces.setMatrixAt(idx, dummy.matrix);
+      });
+      crates.instanceMatrix.needsUpdate = true;
+      braces.instanceMatrix.needsUpdate = true;
+      crates.computeBoundingSphere();
+      braces.computeBoundingSphere();
+      this.levelGroup.add(crates, braces);
+    }
+
+    // Instanced Ceiling Light Housings + Glowing Diffusers + 3 Corridor Point Lights
+    const lampColor = lvl.isBossLevel
+      ? 0xff3b18
+      : lvl.hazardType === 'acid'
+      ? 0x88ff66
+      : lvl.keyLightColor;
+    if (ceilingLampCoords.length > 0) {
+      const housingGeo = new THREE.BoxGeometry(1.1, 0.12, 0.46);
+      const bulbGeo = new THREE.BoxGeometry(0.92, 0.08, 0.28);
+      const bulbMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: lampColor,
+        emissiveIntensity: 2.2,
+        roughness: 0.15,
+      });
+      const housings = new THREE.InstancedMesh(housingGeo, trimMat, ceilingLampCoords.length);
+      const bulbs = new THREE.InstancedMesh(bulbGeo, bulbMat, ceilingLampCoords.length);
+      ceilingLampCoords.forEach(([wx, wz], idx) => {
+        dummy.position.set(wx, wh - 0.06, wz);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        housings.setMatrixAt(idx, dummy.matrix);
+
+        dummy.position.set(wx, wh - 0.1, wz);
+        dummy.updateMatrix();
+        bulbs.setMatrixAt(idx, dummy.matrix);
+      });
+      housings.instanceMatrix.needsUpdate = true;
+      bulbs.instanceMatrix.needsUpdate = true;
+      housings.computeBoundingSphere();
+      bulbs.computeBoundingSphere();
+      this.levelGroup.add(housings, bulbs);
+
+      const poolCount = Math.min(3, ceilingLampCoords.length);
+      for (let i = 0; i < poolCount; i++) {
+        const pick = ceilingLampCoords[Math.floor((i * ceilingLampCoords.length) / poolCount)];
+        const poolLight = new THREE.PointLight(lampColor, 1.85, 16, 1.5);
+        poolLight.position.set(pick[0], wh - 0.35, pick[1]);
+        this.levelGroup.add(poolLight);
+      }
+    }
+
+    // Atmospheric floating dust / embers / toxic spores
+    const dustCount = 180;
+    const dustPos = new Float32Array(dustCount * 3);
+    this.ambientBasePos = new Float32Array(dustCount * 3);
+    for (let i = 0; i < dustCount; i++) {
+      const dx = Math.random() * mapW - cs * 0.5;
+      const dy = 0.2 + Math.random() * (wh - 0.5);
+      const dz = Math.random() * mapH - cs * 0.5;
+      dustPos[i * 3] = dx;
+      dustPos[i * 3 + 1] = dy;
+      dustPos[i * 3 + 2] = dz;
+      this.ambientBasePos[i * 3] = dx;
+      this.ambientBasePos[i * 3 + 1] = dy;
+      this.ambientBasePos[i * 3 + 2] = dz;
+    }
+    const dustGeo = new THREE.BufferGeometry();
+    dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+    const dustMat = new THREE.PointsMaterial({
+      color: lvl.isBossLevel || lvl.hazardType === 'lava' ? 0xff9944 : lvl.hazardType === 'acid' ? 0x88ff66 : 0xaaccff,
+      map: this.textures.softParticleTex,
+      size: 0.14,
+      transparent: true,
+      opacity: 0.44,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    this.ambientPoints = new THREE.Points(dustGeo, dustMat);
+    this.levelGroup.add(this.ambientPoints);
 
     // Add 1 warm reactor/atrium accent point light in center of map
     const centerLight = new THREE.PointLight(
@@ -698,8 +1130,13 @@ export class DoomEngine {
   }
 
   private spawnEnemy(kind: EnemyKind, x: number, z: number, startAlerted = false): void {
-    const rig = buildEnemyModel(kind);
+    const rig = buildEnemyModel(kind, this.textures);
     rig.root.position.set(x, 0, z);
+    for (const m of rig.hitMeshes) {
+      const mat = m.material as THREE.MeshStandardMaterial;
+      m.userData.baseEmissive = mat.emissive ? mat.emissive.getHex() : 0;
+      m.userData.baseEmissiveIntensity = mat.emissiveIntensity ?? 0;
+    }
     this.entityGroup.add(rig.root);
 
     const diffMult = this.difficulty === 'facil' ? 0.75 : this.difficulty === 'pesadilla' ? 1.3 : 1.0;
@@ -753,6 +1190,10 @@ export class DoomEngine {
     if (ch === 'D' || ch === 'K') {
       const door = this.doors.find((d) => d.gx === gx && d.gz === gz);
       if (door && door.openProgress < 0.72) return true;
+    }
+    if (ch === '?') {
+      const secret = this.secretWalls.find((s) => s.gx === gx && s.gz === gz);
+      if (secret && secret.openProgress < 0.72) return true;
     }
     return false;
   }
@@ -866,7 +1307,14 @@ export class DoomEngine {
   }
 
   public restartSector(): void {
-    this.loadLevel(this.sectorIndex, this.sectorIndex === 0 || this.phase === 'victory');
+    const fullReset = this.sectorIndex === 0 || this.phase === 'victory';
+    const wasDead = this.phase === 'gameover' || this.health <= 0;
+    this.loadLevel(this.sectorIndex, fullReset);
+    if (!fullReset) {
+      this.health = this.maxHealth;
+      const startArmor = this.difficulty === 'facil' ? 50 : this.difficulty === 'normal' ? 35 : 15;
+      this.armor = wasDead ? startArmor : Math.max(this.armor, startArmor);
+    }
     this.phase = 'playing';
     this.requestPointerLock();
     this.emitHud();
@@ -922,6 +1370,10 @@ export class DoomEngine {
       this.invertY = invert;
       this.emitHud();
     }
+  }
+
+  public setCinematicActive(active: boolean): void {
+    this.cinematicActive = active;
   }
 
   private cycleWeapon(delta: number): void {
@@ -1031,8 +1483,16 @@ export class DoomEngine {
     const h = this.container.clientHeight || window.innerHeight;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    const pr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2);
     this.renderer.setSize(w, h);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(pr);
+    if (this.composer) {
+      this.composer.setPixelRatio(pr);
+      this.composer.setSize(w, h);
+    }
+    if (this.bloomPass) {
+      this.bloomPass.resolution.set(w, h);
+    }
   };
 
   private onWindowBlur = (): void => {
@@ -1140,7 +1600,11 @@ export class DoomEngine {
       const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
 
       this.update(dt, now * 0.001);
-      this.renderer.render(this.scene, this.camera);
+      if (this.composer) {
+        this.composer.render();
+      } else {
+        this.renderer.render(this.scene, this.camera);
+      }
 
       if (this.isSoftwareGl) {
         this.afterDraw(tick);
@@ -1158,6 +1622,10 @@ export class DoomEngine {
 
   private afterDraw(cb: () => void): void {
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (!gl || typeof gl.fenceSync !== 'function') {
+      this.frameId = window.setTimeout(cb, 80);
+      return;
+    }
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl.flush();
     const poll = () => {
@@ -1174,9 +1642,26 @@ export class DoomEngine {
   }
 
   private update(dt: number, elapsedSec: number): void {
-    // Animate hazard texture flow regardless of phase
+    // Animate hazard texture flow & atmospheric dust/embers regardless of phase
     this.textures.lavaFloor.offset.set(elapsedSec * 0.08, Math.sin(elapsedSec * 0.5) * 0.05);
+    this.textures.lavaFloorNormal.offset.copy(this.textures.lavaFloor.offset);
     this.textures.acidFloor.offset.set(-elapsedSec * 0.06, Math.cos(elapsedSec * 0.4) * 0.05);
+    this.textures.acidFloorNormal.offset.copy(this.textures.acidFloor.offset);
+
+    if (this.ambientPoints && this.ambientBasePos) {
+      const posAttr = this.ambientPoints.geometry.attributes.position as THREE.BufferAttribute;
+      const arr = posAttr.array as Float32Array;
+      const wh = this.level.wallHeight - 0.3;
+      for (let i = 0; i < arr.length; i += 3) {
+        const bx = this.ambientBasePos[i];
+        const by = this.ambientBasePos[i + 1];
+        const bz = this.ambientBasePos[i + 2];
+        arr[i] = bx + Math.sin(elapsedSec * 0.65 + i) * 0.25;
+        arr[i + 1] = 0.2 + ((by + elapsedSec * 0.22 + i * 0.05) % wh);
+        arr[i + 2] = bz + Math.cos(elapsedSec * 0.55 + i) * 0.25;
+      }
+      posAttr.needsUpdate = true;
+    }
 
     if (this.exitParts) {
       this.exitParts.ring.rotation.z = elapsedSec * 1.4;
@@ -1242,13 +1727,14 @@ export class DoomEngine {
     }
 
     this.updatePlayer(dt);
-    this.updateWeapons(dt);
+    this.updateWeapons(dt, elapsedSec);
     this.updateDoors(dt);
     this.updatePickups(dt, elapsedSec);
     this.updateBarrels(dt);
     this.updateEnemies(dt, elapsedSec);
     this.updateProjectiles(dt);
     this.updateParticles(dt);
+    this.updateShellsAndDecals(dt);
     this.updateCameraTransform(dt);
 
     this.hudSyncTimer += dt;
@@ -1305,6 +1791,17 @@ export class DoomEngine {
 
     const sprinting = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') || this.padSprint;
     const maxSpeed = sprinting ? 9.8 : 7.0;
+
+    // Smooth camera strafe roll & dynamic sprint FOV
+    const targetRoll = -moveS * 0.022;
+    this.cameraRoll = THREE.MathUtils.damp(this.cameraRoll, targetRoll, 12, dt);
+    const targetFov = sprinting && len > 0.2 ? 77.5 : 72;
+    const nextFov = THREE.MathUtils.damp(this.currentFov, targetFov, 10, dt);
+    if (Math.abs(nextFov - this.currentFov) > 0.01) {
+      this.currentFov = nextFov;
+      this.camera.fov = nextFov;
+      this.camera.updateProjectionMatrix();
+    }
 
     // Forward & right vectors from yaw
     const sinY = Math.sin(this.yaw);
@@ -1369,6 +1866,16 @@ export class DoomEngine {
       }
     }
 
+    // Secret push-wall proximity prompt
+    for (const sw of this.secretWalls) {
+      if (sw.discovered) continue;
+      const dx = sw.gx * this.level.cellSize - this.px;
+      const dz = sw.gz * this.level.cellSize - this.pz;
+      if (dx * dx + dz * dz < 8.5) {
+        this.promptText = '[E] EMPUJAR MURO SOSPECHOSO';
+      }
+    }
+
     // Exit portal proximity (non-boss sectors)
     if (this.hasExitPortal) {
       const exDistSq = (this.exitPos.x - this.px) ** 2 + (this.exitPos.z - this.pz) ** 2;
@@ -1401,6 +1908,26 @@ export class DoomEngine {
       const dz = d.gz * this.level.cellSize - this.pz;
       if (dx * dx + dz * dz < 11) {
         this.openDoor(d);
+      }
+    }
+    for (const sw of this.secretWalls) {
+      if (sw.discovered) continue;
+      const wx = sw.gx * this.level.cellSize;
+      const wz = sw.gz * this.level.cellSize;
+      const dx = wx - this.px;
+      const dz = wz - this.pz;
+      if (dx * dx + dz * dz < 12.5) {
+        sw.discovered = true;
+        sw.targetOpen = 1;
+        this.secretsFound++;
+        this.score += 500;
+        this.pickupFlash = 0.65;
+        this.faceMood = 'grin';
+        this.faceMoodTimer = 0.65;
+        this.spawnParticles(wx, 1.4, wz, 18, 0xffdd44);
+        this.audio.playPickup(true);
+        this.setStatus('¡CUARTO SECRETO DESCUBIERTO! +500 PTS', 2.8);
+        this.emitHud();
       }
     }
     if (this.hasExitPortal) {
@@ -1439,7 +1966,7 @@ export class DoomEngine {
     this.emitHud();
   }
 
-  private updateWeapons(dt: number): void {
+  private updateWeapons(dt: number, elapsedSec: number): void {
     const spec = WEAPON_SPECS[this.activeWeapon];
     const anyFireHeld = this.fireHeld || this.padFireHeld;
     const wantsFire = spec.isAuto ? anyFireHeld : this.fireJustPressed || anyFireHeld;
@@ -1458,32 +1985,40 @@ export class DoomEngine {
       if (spinner) spinner.rotation.z += this.chaingunSpinSpeed * dt;
     }
 
-    // Smooth weapon bob, recoil, and switch dip
+    // Smooth weapon bob, idle breathing, camera inertia sway, recoil, and switch dip
     this.weaponRecoil = THREE.MathUtils.damp(this.weaponRecoil, 0, 14, dt);
     this.weaponSwitchDip = THREE.MathUtils.damp(this.weaponSwitchDip, 0, 14, dt);
+    const targetSwayX = THREE.MathUtils.clamp((this.yaw - this.smoothYaw) * 0.45, -0.04, 0.04);
+    const targetSwayY = THREE.MathUtils.clamp((this.pitch - this.smoothPitch) * 0.45, -0.03, 0.03);
+    this.weaponSwayX = THREE.MathUtils.damp(this.weaponSwayX, targetSwayX, 16, dt);
+    this.weaponSwayY = THREE.MathUtils.damp(this.weaponSwayY, targetSwayY, 16, dt);
 
     const speed = Math.hypot(this.pvx, this.pvz);
     const bobAmt = Math.min(speed / 7, 1) * 0.018;
     const bobX = Math.cos(this.walkBob * 0.5) * bobAmt;
     const bobY = Math.abs(Math.sin(this.walkBob)) * bobAmt;
+    const breathY = Math.sin(elapsedSec * 2.1) * 0.0032;
     const sawJitter =
       this.activeWeapon === 'chainsaw'
         ? (Math.random() - 0.5) * (wantsFire ? 0.014 : 0.004)
         : 0;
 
     this.weaponMount.position.set(
-      0.22 + bobX + sawJitter,
-      -0.24 - bobY - this.weaponSwitchDip - this.weaponRecoil * 0.14 + sawJitter,
+      0.22 + bobX + this.weaponSwayX + sawJitter,
+      -0.24 - bobY + breathY + this.weaponSwayY - this.weaponSwitchDip - this.weaponRecoil * 0.14 + sawJitter,
       -0.28 + this.weaponRecoil * 0.35,
     );
     this.weaponMount.rotation.x = this.weaponRecoil * 0.75;
+    this.weaponMount.rotation.y = this.weaponSwayX * 0.65;
+    this.weaponMount.rotation.z = this.cameraRoll * 1.4;
 
     if (this.muzzleFlashTimer > 0 && !spec.isMelee) {
-      this.muzzleLight.intensity = 4.2;
+      this.muzzleLight.intensity = 4.6;
       this.muzzleLight.color.setHex(spec.color);
       (this.muzzleMesh.material as THREE.MeshBasicMaterial).color.setHex(spec.color);
-      (this.muzzleMesh.material as THREE.MeshBasicMaterial).opacity = 0.92;
-      this.muzzleMesh.rotation.z += dt * 28;
+      (this.muzzleMesh.material as THREE.MeshBasicMaterial).opacity = 0.94;
+      this.muzzleMesh.scale.setScalar(0.85 + Math.random() * 0.45);
+      this.muzzleMesh.rotation.z += dt * 32;
     } else {
       this.muzzleLight.intensity = 0;
       (this.muzzleMesh.material as THREE.MeshBasicMaterial).opacity = 0;
@@ -1501,6 +2036,15 @@ export class DoomEngine {
     this.shakeIntensity = Math.max(this.shakeIntensity, spec.recoilKick * 0.14);
     this.audio.playWeaponFire(this.activeWeapon);
 
+    if (
+      this.activeWeapon === 'pistol' ||
+      this.activeWeapon === 'shotgun' ||
+      this.activeWeapon === 'supershotgun' ||
+      this.activeWeapon === 'chaingun'
+    ) {
+      this.spawnShellCasing(this.activeWeapon === 'supershotgun' ? 2 : 1);
+    }
+
     // Alert nearby enemies on gunshot sound!
     for (const e of this.enemies) {
       if (e.state === 'patrol') {
@@ -1512,8 +2056,8 @@ export class DoomEngine {
       }
     }
 
-    // Forward direction from camera
-    _euler.set(this.pitch, this.yaw, 0, 'YXZ');
+    // Forward direction from smoothed camera aim
+    _euler.set(this.smoothPitch, this.smoothYaw, 0, 'YXZ');
 
     if (!spec.isProjectile) {
       // Hitscan / Melee pellets
@@ -1543,10 +2087,10 @@ export class DoomEngine {
       const projKind: ProjectileEntity['kind'] = isRocket ? 'rocket' : isBfg ? 'bfg' : 'plasma';
       const mesh = new THREE.Mesh(
         isRocket
-          ? new THREE.CylinderGeometry(0.08, 0.08, 0.42, 8)
+          ? new THREE.CylinderGeometry(0.08, 0.08, 0.42, 18)
           : isBfg
-          ? new THREE.IcosahedronGeometry(0.32, 1)
-          : new THREE.SphereGeometry(0.11, 8, 8),
+          ? new THREE.SphereGeometry(0.32, 18, 14)
+          : new THREE.SphereGeometry(0.11, 14, 12),
         new THREE.MeshBasicMaterial({ color: spec.color }),
       );
       if (isRocket) {
@@ -1657,6 +2201,7 @@ export class DoomEngine {
       ignoreBarrel.mesh.visible = false;
     }
     this.audio.playExplosion();
+    this.spawnDecal(ex, ez, 'scorch', 1.85);
     this.spawnParticles(ex, ey, ez, 24, particleColor);
     this.spawnParticles(ex, ey + 0.3, ez, 12, particleColor === 0xff6611 ? 0xffdd44 : 0xaaffbb);
     this.hitstopTimer = Math.max(this.hitstopTimer, 0.05);
@@ -1750,6 +2295,7 @@ export class DoomEngine {
 
       if (enemy.kind === 'titan') {
         this.audio.playExplosion();
+        this.spawnDecal(enemy.x, enemy.z, 'scorch', 2.4);
         this.spawnParticles(enemy.x, 1.8, enemy.z, 30, 0xff5511);
         this.spawnParticles(enemy.x, 2.6, enemy.z, 24, 0xffdd44);
         this.hitstopTimer = Math.max(this.hitstopTimer, 0.08);
@@ -1758,6 +2304,7 @@ export class DoomEngine {
         this.bossVictoryCountdown = 2.0;
       } else {
         this.audio.playEnemyDeath();
+        this.spawnDecal(enemy.x, enemy.z, 'blood', enemy.kind === 'baron' ? 1.55 : 1.1);
         this.spawnParticles(enemy.x, 1.0, enemy.z, 14, 0xdd1818);
         if (heavy) {
           this.hitstopTimer = Math.max(this.hitstopTimer, 0.04);
@@ -1766,6 +2313,7 @@ export class DoomEngine {
       this.faceMood = 'grin';
       this.faceMoodTimer = 0.45;
     } else {
+      this.spawnDecal(enemy.x, enemy.z, 'blood', 0.72);
       this.audio.playEnemyHit();
     }
   }
@@ -1813,6 +2361,10 @@ export class DoomEngine {
       }
       d.openProgress = THREE.MathUtils.damp(d.openProgress, d.targetOpen, 6.5, dt);
       d.mesh.position.y = d.baseY + d.openProgress * (this.level.wallHeight - 0.15);
+    }
+    for (const sw of this.secretWalls) {
+      sw.openProgress = THREE.MathUtils.damp(sw.openProgress, sw.targetOpen, 4.8, dt);
+      sw.mesh.position.y = sw.baseY + sw.openProgress * (this.level.wallHeight - 0.12);
     }
   }
 
@@ -1917,18 +2469,19 @@ export class DoomEngine {
         continue;
       }
 
-      // Hit flash & squash-and-stretch recovery
+      // Hit flash & squash-and-stretch recovery (preserving glowing eyes/cores!)
       if (e.hitFlash > 0) {
         e.hitFlash = Math.max(0, e.hitFlash - dt);
         const flashVal = e.hitFlash > 0 ? 1 : 0;
         for (const m of e.rig.hitMeshes) {
           const mat = m.material as THREE.MeshStandardMaterial;
+          if (!mat.emissive) continue;
           if (flashVal > 0) {
             mat.emissive.setHex(0xffffff);
             mat.emissiveIntensity = 1.6;
           } else {
-            mat.emissive.setHex(0x000000);
-            mat.emissiveIntensity = 0;
+            mat.emissive.setHex(m.userData.baseEmissive ?? 0);
+            mat.emissiveIntensity = m.userData.baseEmissiveIntensity ?? 0;
           }
         }
       }
@@ -1950,6 +2503,11 @@ export class DoomEngine {
       let moveX = 0;
       let moveZ = 0;
 
+      const dampYaw = (target: number) => {
+        const diff = Math.atan2(Math.sin(target - e.yaw), Math.cos(target - e.yaw));
+        e.yaw += diff * (1 - Math.exp(-12 * dt));
+      };
+
       if (e.state === 'patrol') {
         if (canSee) {
           e.state = 'chase';
@@ -1963,10 +2521,10 @@ export class DoomEngine {
           }
           moveX = Math.cos(e.patrolDir) * e.speed * 0.38;
           moveZ = Math.sin(e.patrolDir) * e.speed * 0.38;
-          e.yaw = Math.atan2(moveX, moveZ);
+          dampYaw(Math.atan2(moveX, moveZ));
         }
       } else if (e.state === 'chase') {
-        e.yaw = Math.atan2(dx, dz);
+        dampYaw(Math.atan2(dx, dz));
         e.strafeTimer -= dt;
         if (e.strafeTimer <= 0) {
           e.strafeSign *= -1;
@@ -2005,7 +2563,7 @@ export class DoomEngine {
         }
       } else if (e.state === 'windup') {
         // Visible attack telegraph!
-        e.yaw = Math.atan2(dx, dz);
+        dampYaw(Math.atan2(dx, dz));
         e.stateTimer -= dt;
         const maxWindup = e.kind === 'baron' || e.kind === 'titan' ? 0.64 : 0.5;
         const charge = THREE.MathUtils.clamp(1 - e.stateTimer / maxWindup, 0, 1);
@@ -2093,7 +2651,7 @@ export class DoomEngine {
       dmg: number,
     ) => {
       const mesh = new THREE.Mesh(
-        new THREE.IcosahedronGeometry(size, 0),
+        new THREE.SphereGeometry(size, 16, 12),
         new THREE.MeshBasicMaterial({ color }),
       );
       const sx = e.x + dirX * (e.kind === 'titan' ? 1.1 : 0.7);
@@ -2216,6 +2774,27 @@ export class DoomEngine {
         this.projectiles.splice(i, 1);
       }
     }
+
+    // Attach 2 pooled dynamic point lights to active bright projectiles
+    for (let li = 0; li < this.projLights.length; li++) {
+      const pl = this.projLights[li];
+      const proj = this.projectiles[this.projectiles.length - 1 - li];
+      if (proj) {
+        pl.position.set(proj.x, proj.y, proj.z);
+        const colorMap: Record<ProjectileEntity['kind'], number> = {
+          plasma: 0x22eeff,
+          rocket: 0xff8822,
+          bfg: 0x33ff66,
+          fireball: 0xff6611,
+          caco_orb: 0xff33ee,
+          baron_orb: 0xff4400,
+        };
+        pl.color.setHex(colorMap[proj.kind]);
+        pl.intensity = proj.kind === 'bfg' ? 3.8 : 2.3;
+      } else {
+        pl.intensity = 0;
+      }
+    }
   }
 
   private spawnParticles(x: number, y: number, z: number, count: number, colorHex: number): void {
@@ -2261,14 +2840,97 @@ export class DoomEngine {
     }
   }
 
-  private updateCameraTransform(_dt: number): void {
+  private spawnShellCasing(count: number): void {
+    const sinY = Math.sin(this.smoothYaw);
+    const cosY = Math.cos(this.smoothYaw);
+    const rightX = cosY;
+    const rightZ = -sinY;
+    const fwdX = -sinY;
+    const fwdZ = -cosY;
+    let spawned = 0;
+    for (const sh of this.shells) {
+      if (sh.active) continue;
+      sh.active = true;
+      sh.x = this.px + rightX * 0.28 + fwdX * 0.35;
+      sh.y = this.py - 0.16;
+      sh.z = this.pz + rightZ * 0.28 + fwdZ * 0.35;
+      const sideSpd = 1.8 + Math.random() * 1.4;
+      sh.vx = rightX * sideSpd + (Math.random() - 0.5) * 0.6;
+      sh.vy = 1.6 + Math.random() * 0.9;
+      sh.vz = rightZ * sideSpd + (Math.random() - 0.5) * 0.6;
+      sh.rx = Math.random() * 6;
+      sh.ry = Math.random() * 6;
+      sh.rz = Math.random() * 6;
+      sh.life = 1.4;
+      sh.mesh.position.set(sh.x, sh.y, sh.z);
+      sh.mesh.visible = true;
+      spawned++;
+      if (spawned >= count) break;
+    }
+  }
+
+  private spawnDecal(x: number, z: number, kind: 'blood' | 'scorch', size: number): void {
+    const dec = this.decals[this.decalCursor % this.decals.length];
+    this.decalCursor++;
+    const mat = dec.mesh.material as THREE.MeshBasicMaterial;
+    mat.map = kind === 'scorch' ? this.textures.decalScorchTex : this.textures.decalBloodTex;
+    mat.opacity = kind === 'scorch' ? 0.88 : 0.82;
+    mat.needsUpdate = true;
+    dec.mesh.position.set(x, 0.022 + (this.decalCursor % 4) * 0.001, z);
+    dec.mesh.rotation.y = Math.random() * Math.PI * 2;
+    dec.mesh.scale.setScalar(size);
+    dec.mesh.visible = true;
+    dec.timer = 22;
+  }
+
+  private updateShellsAndDecals(dt: number): void {
+    for (const sh of this.shells) {
+      if (!sh.active) continue;
+      sh.life -= dt;
+      if (sh.life <= 0) {
+        sh.active = false;
+        sh.mesh.visible = false;
+        continue;
+      }
+      sh.vy -= 14 * dt;
+      sh.x += sh.vx * dt;
+      sh.y += sh.vy * dt;
+      sh.z += sh.vz * dt;
+      if (sh.y < 0.03) {
+        sh.y = 0.03;
+        sh.vy = -sh.vy * 0.42;
+        sh.vx *= 0.65;
+        sh.vz *= 0.65;
+      }
+      sh.rx += dt * 18;
+      sh.ry += dt * 14;
+      sh.mesh.position.set(sh.x, sh.y, sh.z);
+      sh.mesh.rotation.set(sh.rx, sh.ry, sh.rz);
+    }
+
+    for (const dec of this.decals) {
+      if (!dec.mesh.visible) continue;
+      dec.timer -= dt;
+      if (dec.timer < 3) {
+        (dec.mesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, (dec.timer / 3) * 0.82);
+      }
+      if (dec.timer <= 0) {
+        dec.mesh.visible = false;
+      }
+    }
+  }
+
+  private updateCameraTransform(dt: number): void {
+    this.smoothYaw = THREE.MathUtils.damp(this.smoothYaw, this.yaw, 36, dt);
+    this.smoothPitch = THREE.MathUtils.damp(this.smoothPitch, this.pitch, 36, dt);
+
     const speed = Math.hypot(this.pvx, this.pvz);
-    const bobOffset = Math.sin(this.walkBob) * Math.min(speed / 7, 1) * 0.055;
+    const bobOffset = Math.sin(this.walkBob) * Math.min(speed / 7, 1) * 0.05;
     const shakeX = (Math.random() - 0.5) * this.shakeIntensity;
     const shakeY = (Math.random() - 0.5) * this.shakeIntensity;
 
     this.camera.position.set(this.px + shakeX, this.py + bobOffset + shakeY, this.pz);
-    _euler.set(this.pitch, this.yaw, 0, 'YXZ');
+    _euler.set(this.smoothPitch, this.smoothYaw, this.cameraRoll, 'YXZ');
     this.camera.quaternion.setFromEuler(_euler);
   }
 
@@ -2300,6 +2962,11 @@ export class DoomEngine {
     for (const d of this.doors) {
       entities.push({ x: d.gx, z: d.gz, kind: 'door', alive: d.locked });
     }
+    for (const sw of this.secretWalls) {
+      if (sw.discovered) {
+        entities.push({ x: sw.gx, z: sw.gz, kind: 'secret', alive: true });
+      }
+    }
     if (this.hasExitPortal) {
       entities.push({ x: this.exitPos.x / cs, z: this.exitPos.z / cs, kind: 'exit' });
     }
@@ -2324,6 +2991,8 @@ export class DoomEngine {
       hasKey: this.hasKey,
       kills: this.kills,
       totalEnemies: this.totalEnemies,
+      secretsFound: this.secretsFound,
+      totalSecrets: this.totalSecrets,
       shotsFired: this.shotsFired,
       shotsHit: this.shotsHit,
       elapsedSeconds: this.elapsedSeconds,
@@ -2342,7 +3011,7 @@ export class DoomEngine {
       invertY: this.invertY,
       playerGridX: this.px / cs,
       playerGridZ: this.pz / cs,
-      playerYaw: this.yaw,
+      playerYaw: this.smoothYaw,
       exploredCells: this.explored,
       automapGrid: this.level.grid,
       automapEntities: entities,
@@ -2422,7 +3091,7 @@ export class DoomEngine {
       return Math.sign(val) * (scaled * scaled * 0.65 + scaled * 0.35);
     };
 
-    if (this.phase === 'title') {
+    if (this.phase === 'title' && !this.cinematicActive) {
       const tiers: Difficulty[] = ['facil', 'normal', 'pesadilla'];
       if (justPressed(14) || justPressed(4)) {
         const idx = tiers.indexOf(this.difficulty);
@@ -2442,12 +3111,16 @@ export class DoomEngine {
       this.padMoveX = lx;
       this.padMoveY = THREE.MathUtils.clamp(-ly + dUp - dDown, -1, 1);
 
-      // Right Stick for smooth camera aim (supports standard [2,3] and non-standard [2,5] or [3,4])
+      // Right Stick for smooth camera aim (supports standard [2,3] and PS3 DualShock 3 / DirectInput [2,5] or [3,4])
+      const isDualShock3 = /playstation|sony|dualshock|sixaxis|ps3|054c/i.test(pad.id || '');
       let rawRx = pad.axes[2] ?? 0;
       let rawRy = pad.axes[3] ?? 0;
       if (pad.mapping !== 'standard' && pad.axes.length >= 6) {
-        // On many DirectInput controllers, axes[3] & axes[4] are triggers resting at -1, and axes[5] is Right-Y
-        if (Math.abs(rawRy) > 0.85 && Math.abs(pad.axes[5] ?? 0) < 0.85) {
+        if (isDualShock3 && Math.abs(pad.axes[2] ?? 0) < 0.05 && Math.abs(pad.axes[4] ?? 0) > 0.15) {
+          // Some Linux/PS3 SIXAXIS drivers map Right-X to axis 3 or 2 and Right-Y to axis 4 or 5
+          rawRx = pad.axes[3] ?? rawRx;
+          rawRy = pad.axes[4] ?? rawRy;
+        } else if (Math.abs(rawRy) > 0.85 && Math.abs(pad.axes[5] ?? 0) < 0.85) {
           rawRy = pad.axes[5] ?? 0;
         }
       }
@@ -2465,31 +3138,33 @@ export class DoomEngine {
         );
       }
 
-      // Sprint: LT (6) or L3 (10)
-      this.padSprint = btnPressed(6) || btnPressed(10);
+      // Sprint: LT / L2 (6) or L3 (10)
+      const l2Axis = pad.mapping !== 'standard' && pad.axes.length > 4 && isDualShock3 ? (pad.axes[4] ?? -1) > 0.2 : false;
+      this.padSprint = btnPressed(6) || btnPressed(10) || l2Axis;
 
-      // Shoot: RT (7) or A/Cross (0)
-      const firing = btnPressed(7) || btnPressed(0);
+      // Shoot: RT / R2 (7) or Cross / A (0)
+      const r2Axis = pad.mapping !== 'standard' && pad.axes.length > 5 && isDualShock3 ? (pad.axes[5] ?? -1) > 0.2 : false;
+      const firing = btnPressed(7) || btnPressed(0) || r2Axis;
       if (firing && !this.padFireHeld) {
         this.fireJustPressed = true;
         this.audio.unlock();
       }
       this.padFireHeld = firing;
 
-      // Weapons: LB (4) / D-Pad Left (14) prev, RB (5) / D-Pad Right (15) / Y (3) next
+      // Weapons: L1/LB (4) / D-Pad Left (14) prev, R1/RB (5) / D-Pad Right (15) / Triangle/Y (3) next
       if (justPressed(4) || justPressed(14)) {
         this.cycleWeapon(-1);
       } else if (justPressed(5) || justPressed(15) || justPressed(3)) {
         this.cycleWeapon(1);
       }
 
-      // Interact: X/Square (2)
-      if (justPressed(2)) {
+      // Interact (Doors, Secret Walls, Exit): Square/X (2) or Circle/B (1)
+      if (justPressed(2) || justPressed(1)) {
         this.tryInteract();
       }
 
-      // Pause: Start/Options (9)
-      if (justPressed(9)) {
+      // Pause: Start (9) or PS3 Select (8)
+      if (justPressed(9) || (isDualShock3 && justPressed(8))) {
         this.pauseGame();
       }
     } else if (this.phase === 'paused') {
@@ -2535,6 +3210,7 @@ export class DoomEngine {
     this.audio.dispose();
     this.textures.dispose();
     if (this.envRT) this.envRT.dispose();
+    if (this.composer) this.composer.dispose();
     this.renderer.dispose();
     if (canvas.parentElement === this.container) {
       this.container.removeChild(canvas);

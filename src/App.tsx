@@ -4,6 +4,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { CinematicPlayer } from './components/CinematicPlayer';
 import { GameHud } from './components/GameHud';
 import { GameModal } from './components/GameModal';
 import { OptionsModal } from './components/OptionsModal';
@@ -14,9 +15,14 @@ import { Difficulty, HudSnapshot, WeaponId } from './game/types';
 export default function App() {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<DoomEngine | null>(null);
+  const introPlayedRef = useRef(false);
+  const endingShownForVictoryRef = useRef(false);
+  const pendingStartDifficultyRef = useRef<Difficulty | null>(null);
+
   const [difficulty, setDifficulty] = useState<Difficulty>('normal');
   const [startSectorIndex, setStartSectorIndex] = useState(0);
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [cinematicMode, setCinematicMode] = useState<'intro' | 'ending' | null>(null);
   const [hud, setHud] = useState<HudSnapshot | null>(null);
 
   useEffect(() => {
@@ -26,6 +32,10 @@ export default function App() {
       setHud(snapshot);
       if (snapshot.phase === 'playing') {
         setOptionsOpen(false);
+        endingShownForVictoryRef.current = false;
+      } else if (snapshot.phase === 'victory' && !endingShownForVictoryRef.current) {
+        endingShownForVictoryRef.current = true;
+        setCinematicMode('ending');
       }
     });
     engineRef.current = engine;
@@ -34,6 +44,10 @@ export default function App() {
       engineRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    engineRef.current?.setCinematicActive(Boolean(cinematicMode));
+  }, [cinematicMode]);
 
   const handleSelectDifficulty = useCallback((d: Difficulty) => {
     setDifficulty(d);
@@ -57,10 +71,37 @@ export default function App() {
   const handleStart = useCallback(
     (d: Difficulty) => {
       setOptionsOpen(false);
+      if (startSectorIndex === 0 && !introPlayedRef.current) {
+        introPlayedRef.current = true;
+        pendingStartDifficultyRef.current = d;
+        setCinematicMode('intro');
+        return;
+      }
       engineRef.current?.startGame(d, startSectorIndex);
     },
     [startSectorIndex],
   );
+
+  const handleOpenIntro = useCallback(() => {
+    setOptionsOpen(false);
+    pendingStartDifficultyRef.current = null;
+    setCinematicMode('intro');
+  }, []);
+
+  const handleWatchEnding = useCallback(() => {
+    setOptionsOpen(false);
+    setCinematicMode('ending');
+  }, []);
+
+  const handleCompleteCinematic = useCallback(() => {
+    const currentMode = cinematicMode;
+    setCinematicMode(null);
+    if (currentMode === 'intro' && pendingStartDifficultyRef.current) {
+      const diff = pendingStartDifficultyRef.current;
+      pendingStartDifficultyRef.current = null;
+      engineRef.current?.startGame(diff, startSectorIndex);
+    }
+  }, [cinematicMode, startSectorIndex]);
 
   const handleToggleMute = useCallback(() => {
     engineRef.current?.toggleMute();
@@ -121,7 +162,9 @@ export default function App() {
           muted={hud.muted}
           gamepadConnected={hud.gamepadConnected}
           optionsOpen={optionsOpen}
+          cinematicOpen={Boolean(cinematicMode)}
           onStart={handleStart}
+          onOpenIntro={handleOpenIntro}
           onOpenOptions={handleOpenOptions}
           onToggleMute={handleToggleMute}
         />
@@ -144,11 +187,13 @@ export default function App() {
           <GameModal
             hud={hud}
             optionsOpen={optionsOpen}
+            cinematicOpen={Boolean(cinematicMode)}
             onResume={handleResume}
             onRestart={handleRestart}
             onRestartCampaign={handleRestartCampaign}
             onNextSector={handleNextSector}
             onOpenOptions={handleOpenOptions}
+            onWatchEnding={handleWatchEnding}
             onTitle={handleReturnTitle}
           />
         )}
@@ -170,6 +215,15 @@ export default function App() {
           onToggleInvertY={handleToggleInvertY}
           onToggleMute={handleToggleMute}
           onClose={handleCloseOptions}
+        />
+      )}
+
+      {hud && cinematicMode && (
+        <CinematicPlayer
+          mode={cinematicMode}
+          muted={hud.muted}
+          onToggleMute={handleToggleMute}
+          onComplete={handleCompleteCinematic}
         />
       )}
     </main>

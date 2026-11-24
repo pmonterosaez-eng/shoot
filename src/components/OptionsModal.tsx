@@ -247,7 +247,7 @@ export function OptionsModal({
             <p className="text-[11px] text-emerald-300/90 truncate">{gamepadName}</p>
           ) : (
             <p className="text-[11px] text-stone-400 leading-snug">
-              Conecta tu mando y pulsa cualquier botón del mando (A/X/Start) con esta ventana activa para despertarlo.
+              Conecta tu mando de PlayStation 3 (DualShock 3 / SIXAXIS por USB o Bluetooth), Xbox o PC y pulsa ✕/A/Start con esta ventana activa.
             </p>
           )}
         </div>

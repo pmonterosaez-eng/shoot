@@ -1,26 +1,30 @@
 import { useEffect } from 'react';
-import { SlidersHorizontal } from 'lucide-react';
+import { Film, SlidersHorizontal } from 'lucide-react';
 import { DIFFICULTY_SPECS, HudSnapshot } from '../game/types';
 
 interface GameModalProps {
   hud: HudSnapshot;
   optionsOpen: boolean;
+  cinematicOpen: boolean;
   onResume: () => void;
   onRestart: () => void;
   onRestartCampaign: () => void;
   onNextSector: () => void;
   onOpenOptions: () => void;
+  onWatchEnding: () => void;
   onTitle: () => void;
 }
 
 export function GameModal({
   hud,
   optionsOpen,
+  cinematicOpen,
   onResume,
   onRestart,
   onRestartCampaign,
   onNextSector,
   onOpenOptions,
+  onWatchEnding,
   onTitle,
 }: GameModalProps) {
   const accuracy = hud.shotsFired > 0 ? Math.round((hud.shotsHit / hud.shotsFired) * 100) : 0;
@@ -29,7 +33,7 @@ export function GameModal({
   const timeStr = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
   useEffect(() => {
-    if (optionsOpen) return;
+    if (optionsOpen || cinematicOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.code === 'Enter') {
         e.preventDefault();
@@ -87,16 +91,20 @@ export function GameModal({
             </div>
           </div>
           <div className="p-2.5 bg-[#0b0a0e] border border-stone-800">
+            <div className="text-[10px] tracking-widest text-stone-500">SECRETOS</div>
+            <div className="text-lg font-black text-amber-300">
+              {hud.secretsFound} / {hud.totalSecrets}
+            </div>
+          </div>
+          <div className="p-2.5 bg-[#0b0a0e] border border-stone-800">
             <div className="text-[10px] tracking-widest text-stone-500">PRECISIÓN</div>
             <div className="text-lg font-black text-sky-400">{accuracy}%</div>
           </div>
           <div className="p-2.5 bg-[#0b0a0e] border border-stone-800">
-            <div className="text-[10px] tracking-widest text-stone-500">TIEMPO</div>
-            <div className="text-lg font-black text-stone-200">{timeStr}</div>
-          </div>
-          <div className="p-2.5 bg-[#0b0a0e] border border-stone-800">
-            <div className="text-[10px] tracking-widest text-stone-500">PUNTUACIÓN</div>
-            <div className="text-lg font-black text-amber-300">{hud.score}</div>
+            <div className="text-[10px] tracking-widest text-stone-500">TIEMPO · PTS</div>
+            <div className="text-lg font-black text-stone-200">
+              {timeStr} · <span className="text-amber-300">{hud.score}</span>
+            </div>
           </div>
         </div>
 
@@ -146,13 +154,23 @@ export function GameModal({
                 {hud.phase === 'victory' ? 'REJUGAR COMBATE FINAL' : 'REINTENTAR SECTOR'} [ENTER]
               </button>
               {hud.phase === 'victory' && (
-                <button
-                  type="button"
-                  onClick={onRestartCampaign}
-                  className="w-full py-2.5 bg-[#1e1d25] hover:bg-[#2a2833] border border-stone-600 text-amber-300 text-xs font-bold tracking-[0.18em] uppercase cursor-pointer"
-                >
-                  NUEVA CAMPAÑA (E1M1)
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={onWatchEnding}
+                    className="w-full py-2.5 bg-[#1b1619] hover:bg-[#2a1f24] border border-amber-500/80 text-amber-300 text-xs font-bold tracking-[0.18em] uppercase flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <Film className="w-3.5 h-3.5 text-amber-400" />
+                    <span>VER VIDEO FINAL</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onRestartCampaign}
+                    className="w-full py-2.5 bg-[#1e1d25] hover:bg-[#2a2833] border border-stone-600 text-stone-200 text-xs font-bold tracking-[0.18em] uppercase cursor-pointer"
+                  >
+                    NUEVA CAMPAÑA (E1M1)
+                  </button>
+                </>
               )}
             </>
           )}
