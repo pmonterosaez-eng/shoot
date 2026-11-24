@@ -1,0 +1,6 @@
+{
+  "name": "AVERNO-93",
+  "description": "Juego FPS 3D estilo retro Doom con gráficos pixelados, iluminación atmosférica, armas clásicas y enemigos dinámicos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
